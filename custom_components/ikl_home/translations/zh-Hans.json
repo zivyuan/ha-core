@@ -1,0 +1,25 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "此 APP Key 已经配置过了"
+    },
+    "error": {
+      "already_configured": "此 APP Key 已经配置过了",
+      "unknown": "发生未知错误"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "name": "名称（可选）",
+          "app_key": "APP Key",
+          "app_secret": "APP Secret"
+        },
+        "description": "请输入您的 IKL Home 凭据",
+        "title": "IKL Home 配置",
+        "data_description": {
+          "name": "为app key 设置一个便于识别的名称"
+        }
+      }
+    }
+  }
+}
