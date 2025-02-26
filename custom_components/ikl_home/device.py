@@ -60,8 +60,6 @@ class IKLDevice:
                 self._available = True
                 # 先获取响应文本
                 text = await response.text()
-                print(f"::>> API: {url}")
-                print(f"::>> API raw RESP: {text}")
                 if not text:  # 如果响应为空
                     return {}
                 try:

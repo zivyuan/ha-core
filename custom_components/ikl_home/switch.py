@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -24,11 +24,11 @@ _LOGGER = logging.getLogger(__name__)
 # 加载设备配置
 def load_device_config() -> dict:
     """加载设备配置."""
-    config_path = os.path.join(os.path.dirname(__file__), "device_config.yaml")
+    config_path = Path(__file__).parent / "device_config.yaml"
     try:
-        with open(config_path, encoding="utf-8") as file:
+        with config_path.open(encoding="utf-8") as file:
             return yaml.safe_load(file)
-    except Exception as err:
+    except (OSError, yaml.YAMLError) as err:
         _LOGGER.error("Failed to load device config: %s", err)
         return {}
 
@@ -77,6 +77,7 @@ class IKLSwitchDevice(IKLDevice):
 
     async def _handle_state_update(self, state_data: dict[str, Any]) -> None:
         """处理开关状态更新."""
+        print("Update state: %s", state_data)
         if state_data.get("data"):
             for prop in state_data["data"]:
                 if prop["code"] == self._code:
