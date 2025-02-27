@@ -1,19 +1,25 @@
 """Tests for the Heos config flow module."""
 
-from pyheos import CommandAuthenticationError, CommandFailedError, HeosError
+from typing import Any
+
+from pyheos import CommandAuthenticationError, CommandFailedError, HeosError, HeosSystem
 import pytest
 
-from homeassistant.components import heos, ssdp
 from homeassistant.components.heos.const import DOMAIN
-from homeassistant.config_entries import SOURCE_SSDP, SOURCE_USER
+from homeassistant.config_entries import SOURCE_SSDP, SOURCE_USER, ConfigEntryState
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
+
+from . import MockHeos
 
 from tests.common import MockConfigEntry
 
 
-async def test_flow_aborts_already_setup(hass: HomeAssistant, config_entry) -> None:
+async def test_flow_aborts_already_setup(
+    hass: HomeAssistant, config_entry: MockConfigEntry
+) -> None:
     """Test flow aborts when entry already setup."""
     config_entry.add_to_hass(hass)
 
@@ -35,84 +41,78 @@ async def test_no_host_shows_form(hass: HomeAssistant) -> None:
     assert result["errors"] == {}
 
 
-async def test_cannot_connect_shows_error_form(hass: HomeAssistant, controller) -> None:
+async def test_cannot_connect_shows_error_form(
+    hass: HomeAssistant, controller: MockHeos
+) -> None:
     """Test form is shown with error when cannot connect."""
     controller.connect.side_effect = HeosError()
     result = await hass.config_entries.flow.async_init(
-        heos.DOMAIN, context={"source": SOURCE_USER}, data={CONF_HOST: "127.0.0.1"}
+        DOMAIN, context={"source": SOURCE_USER}, data={CONF_HOST: "127.0.0.1"}
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-    assert result["errors"][CONF_HOST] == "cannot_connect"
+    errors = result["errors"]
+    assert errors is not None
+    assert errors[CONF_HOST] == "cannot_connect"
     assert controller.connect.call_count == 1
     assert controller.disconnect.call_count == 1
 
 
-async def test_create_entry_when_host_valid(hass: HomeAssistant, controller) -> None:
+async def test_create_entry_when_host_valid(
+    hass: HomeAssistant, controller: MockHeos
+) -> None:
     """Test result type is create entry when host is valid."""
     data = {CONF_HOST: "127.0.0.1"}
 
     result = await hass.config_entries.flow.async_init(
-        heos.DOMAIN, context={"source": SOURCE_USER}, data=data
+        DOMAIN, context={"source": SOURCE_USER}, data=data
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["result"].unique_id == DOMAIN
-    assert result["title"] == "HEOS System (via 127.0.0.1)"
+    assert result["title"] == "HEOS System"
     assert result["data"] == data
     assert controller.connect.call_count == 2  # Also called in async_setup_entry
     assert controller.disconnect.call_count == 1
 
 
-async def test_create_entry_when_friendly_name_valid(
-    hass: HomeAssistant, controller
+async def test_discovery(
+    hass: HomeAssistant,
+    discovery_data: SsdpServiceInfo,
+    discovery_data_bedroom: SsdpServiceInfo,
+    controller: MockHeos,
+    system: HeosSystem,
 ) -> None:
-    """Test result type is create entry when friendly name is valid."""
-    hass.data[DOMAIN] = {"Office (127.0.0.1)": "127.0.0.1"}
-    data = {CONF_HOST: "Office (127.0.0.1)"}
-
+    """Test discovery shows form to confirm, then creates entry."""
+    # Single discovered, selects preferred host, shows confirm
+    controller.get_system_info.return_value = system
     result = await hass.config_entries.flow.async_init(
-        heos.DOMAIN, context={"source": SOURCE_USER}, data=data
+        DOMAIN, context={"source": SOURCE_SSDP}, data=discovery_data_bedroom
     )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "confirm_discovery"
+    assert controller.connect.call_count == 1
+    assert controller.get_system_info.call_count == 1
+    assert controller.disconnect.call_count == 1
 
+    # Subsequent discovered hosts abort.
+    subsequent_result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=discovery_data
+    )
+    assert subsequent_result["type"] is FlowResultType.ABORT
+    assert subsequent_result["reason"] == "already_in_progress"
+
+    # Confirm set up
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={}
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["result"].unique_id == DOMAIN
-    assert result["title"] == "HEOS System (via 127.0.0.1)"
+    assert result["title"] == "HEOS System"
     assert result["data"] == {CONF_HOST: "127.0.0.1"}
-    assert controller.connect.call_count == 2  # Also called in async_setup_entry
-    assert controller.disconnect.call_count == 1
-    assert DOMAIN not in hass.data
-
-
-async def test_discovery_shows_create_form(
-    hass: HomeAssistant,
-    controller,
-    discovery_data: ssdp.SsdpServiceInfo,
-    discovery_data_bedroom: ssdp.SsdpServiceInfo,
-) -> None:
-    """Test discovery shows form to confirm setup."""
-
-    # Single discovered host shows form for user to finish setup.
-    result = await hass.config_entries.flow.async_init(
-        heos.DOMAIN, context={"source": SOURCE_SSDP}, data=discovery_data
-    )
-    assert hass.data[DOMAIN] == {"Office (127.0.0.1)": "127.0.0.1"}
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "user"
-
-    # Subsequent discovered hosts append to discovered hosts and abort.
-    result = await hass.config_entries.flow.async_init(
-        heos.DOMAIN, context={"source": SOURCE_SSDP}, data=discovery_data_bedroom
-    )
-    assert hass.data[DOMAIN] == {
-        "Office (127.0.0.1)": "127.0.0.1",
-        "Bedroom (127.0.0.2)": "127.0.0.2",
-    }
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "already_in_progress"
 
 
 async def test_discovery_flow_aborts_already_setup(
-    hass: HomeAssistant, controller, discovery_data: ssdp.SsdpServiceInfo, config_entry
+    hass: HomeAssistant, discovery_data: SsdpServiceInfo, config_entry: MockConfigEntry
 ) -> None:
     """Test discovery flow aborts when entry already setup."""
     config_entry.add_to_hass(hass)
@@ -125,8 +125,22 @@ async def test_discovery_flow_aborts_already_setup(
     assert result["reason"] == "single_instance_allowed"
 
 
+async def test_discovery_fails_to_connect_aborts(
+    hass: HomeAssistant, discovery_data: SsdpServiceInfo, controller: MockHeos
+) -> None:
+    """Test discovery aborts when trying to connect to host."""
+    controller.connect.side_effect = HeosError()
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_SSDP}, data=discovery_data
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cannot_connect"
+    assert controller.connect.call_count == 1
+    assert controller.disconnect.call_count == 1
+
+
 async def test_reconfigure_validates_and_updates_config(
-    hass: HomeAssistant, config_entry, controller
+    hass: HomeAssistant, config_entry: MockConfigEntry, controller: MockHeos
 ) -> None:
     """Test reconfigure validates host and successfully updates."""
     config_entry.add_to_hass(hass)
@@ -134,9 +148,9 @@ async def test_reconfigure_validates_and_updates_config(
     assert config_entry.data[CONF_HOST] == "127.0.0.1"
 
     # Test reconfigure initially shows form with current host value.
-    host = next(
-        key.default() for key in result["data_schema"].schema if key == CONF_HOST
-    )
+    schema = result["data_schema"]
+    assert schema is not None
+    host = next(key.default() for key in schema.schema if key == CONF_HOST)
     assert host == "127.0.0.1"
     assert result["errors"] == {}
     assert result["step_id"] == "reconfigure"
@@ -156,7 +170,7 @@ async def test_reconfigure_validates_and_updates_config(
 
 
 async def test_reconfigure_cannot_connect_recovers(
-    hass: HomeAssistant, config_entry, controller
+    hass: HomeAssistant, config_entry: MockConfigEntry, controller: MockHeos
 ) -> None:
     """Test reconfigure cannot connect and recovers."""
     controller.connect.side_effect = HeosError()
@@ -171,11 +185,13 @@ async def test_reconfigure_cannot_connect_recovers(
 
     assert controller.connect.call_count == 1
     assert controller.disconnect.call_count == 1
-    host = next(
-        key.default() for key in result["data_schema"].schema if key == CONF_HOST
-    )
+    schema = result["data_schema"]
+    assert schema is not None
+    host = next(key.default() for key in schema.schema if key == CONF_HOST)
     assert host == "127.0.0.2"
-    assert result["errors"][CONF_HOST] == "cannot_connect"
+    errors = result["errors"]
+    assert errors is not None
+    assert errors[CONF_HOST] == "cannot_connect"
     assert result["step_id"] == "reconfigure"
     assert result["type"] is FlowResultType.FORM
 
@@ -208,13 +224,14 @@ async def test_reconfigure_cannot_connect_recovers(
 )
 async def test_options_flow_signs_in(
     hass: HomeAssistant,
-    config_entry,
-    controller,
+    config_entry: MockConfigEntry,
+    controller: MockHeos,
     error: HeosError,
     expected_error_key: str,
 ) -> None:
     """Test options flow signs-in with entered credentials."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
 
     # Start the options flow. Entry has not current options.
     assert CONF_USERNAME not in config_entry.options
@@ -249,10 +266,11 @@ async def test_options_flow_signs_in(
 
 
 async def test_options_flow_signs_out(
-    hass: HomeAssistant, config_entry, controller
+    hass: HomeAssistant, config_entry: MockConfigEntry, controller: MockHeos
 ) -> None:
     """Test options flow signs-out when credentials cleared."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
 
     # Start the options flow. Entry has not current options.
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
@@ -261,7 +279,7 @@ async def test_options_flow_signs_out(
     assert result["type"] is FlowResultType.FORM
 
     # Fail to sign-out, show error
-    user_input = {}
+    user_input: dict[str, Any] = {}
     controller.sign_out.side_effect = HeosError()
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], user_input
@@ -293,13 +311,14 @@ async def test_options_flow_signs_out(
 )
 async def test_options_flow_missing_one_param_recovers(
     hass: HomeAssistant,
-    config_entry,
-    controller,
+    config_entry: MockConfigEntry,
+    controller: MockHeos,
     user_input: dict[str, str],
     expected_errors: dict[str, str],
 ) -> None:
     """Test options flow signs-in after recovering from only username or password being entered."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
 
     # Start the options flow. Entry has not current options.
     assert CONF_USERNAME not in config_entry.options
@@ -342,13 +361,15 @@ async def test_options_flow_missing_one_param_recovers(
 async def test_reauth_signs_in_aborts(
     hass: HomeAssistant,
     config_entry: MockConfigEntry,
-    controller,
+    controller: MockHeos,
     error: HeosError,
     expected_error_key: str,
 ) -> None:
     """Test reauth flow signs-in with entered credentials and aborts."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     result = await config_entry.start_reauth_flow(hass)
+    assert config_entry.state is ConfigEntryState.LOADED
 
     assert result["step_id"] == "reauth_confirm"
     assert result["errors"] == {}
@@ -380,17 +401,21 @@ async def test_reauth_signs_in_aborts(
     assert result["type"] is FlowResultType.ABORT
 
 
-async def test_reauth_signs_out(hass: HomeAssistant, config_entry, controller) -> None:
+async def test_reauth_signs_out(
+    hass: HomeAssistant, config_entry: MockConfigEntry, controller: MockHeos
+) -> None:
     """Test reauth flow signs-out when credentials cleared and aborts."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     result = await config_entry.start_reauth_flow(hass)
+    assert config_entry.state is ConfigEntryState.LOADED
 
     assert result["step_id"] == "reauth_confirm"
     assert result["errors"] == {}
     assert result["type"] is FlowResultType.FORM
 
     # Fail to sign-out, show error
-    user_input = {}
+    user_input: dict[str, Any] = {}
     controller.sign_out.side_effect = HeosError()
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], user_input
@@ -424,16 +449,18 @@ async def test_reauth_signs_out(hass: HomeAssistant, config_entry, controller) -
 )
 async def test_reauth_flow_missing_one_param_recovers(
     hass: HomeAssistant,
-    config_entry,
-    controller,
+    config_entry: MockConfigEntry,
+    controller: MockHeos,
     user_input: dict[str, str],
     expected_errors: dict[str, str],
 ) -> None:
     """Test reauth flow signs-in after recovering from only username or password being entered."""
     config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
 
     # Start the options flow. Entry has not current options.
     result = await config_entry.start_reauth_flow(hass)
+    assert config_entry.state is ConfigEntryState.LOADED
     assert result["step_id"] == "reauth_confirm"
     assert result["errors"] == {}
     assert result["type"] is FlowResultType.FORM

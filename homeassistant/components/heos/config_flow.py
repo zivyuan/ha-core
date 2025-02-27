@@ -2,15 +2,14 @@
 
 from collections.abc import Mapping
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from pyheos import CommandAuthenticationError, Heos, HeosError, HeosOptions
 import voluptuous as vol
 
-from homeassistant.components import ssdp
 from homeassistant.config_entries import (
-    ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -18,8 +17,10 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers import selector
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
-from .const import DOMAIN
+from .const import DOMAIN, ENTRY_TITLE
+from .coordinator import HeosConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,11 +32,6 @@ AUTH_SCHEMA = vol.Schema(
         ),
     }
 )
-
-
-def format_title(host: str) -> str:
-    """Format the title for config entries."""
-    return f"HEOS System (via {host})"
 
 
 async def _validate_host(host: str, errors: dict[str, str]) -> bool:
@@ -100,55 +96,80 @@ class HeosFlowHandler(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    def __init__(self) -> None:
+        """Initialize the HEOS flow."""
+        self._discovered_host: str | None = None
+
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+    def async_get_options_flow(config_entry: HeosConfigEntry) -> OptionsFlow:
         """Create the options flow."""
         return HeosOptionsFlowHandler()
 
     async def async_step_ssdp(
-        self, discovery_info: ssdp.SsdpServiceInfo
+        self, discovery_info: SsdpServiceInfo
     ) -> ConfigFlowResult:
         """Handle a discovered Heos device."""
         # Store discovered host
         if TYPE_CHECKING:
             assert discovery_info.ssdp_location
-        hostname = urlparse(discovery_info.ssdp_location).hostname
-        friendly_name = (
-            f"{discovery_info.upnp[ssdp.ATTR_UPNP_FRIENDLY_NAME]} ({hostname})"
-        )
-        self.hass.data.setdefault(DOMAIN, {})
-        self.hass.data[DOMAIN][friendly_name] = hostname
+
         await self.async_set_unique_id(DOMAIN)
-        # Show selection form
-        return self.async_show_form(step_id="user")
+        # Connect to discovered host and get system information
+        hostname = urlparse(discovery_info.ssdp_location).hostname
+        assert hostname is not None
+        heos = Heos(HeosOptions(hostname, events=False, heart_beat=False))
+        try:
+            await heos.connect()
+            system_info = await heos.get_system_info()
+        except HeosError as error:
+            _LOGGER.debug(
+                "Failed to retrieve system information from discovered HEOS device %s",
+                hostname,
+                exc_info=error,
+            )
+            return self.async_abort(reason="cannot_connect")
+        finally:
+            await heos.disconnect()
+
+        # Select the preferred host, if available
+        if system_info.preferred_hosts:
+            hostname = system_info.preferred_hosts[0].ip_address
+        self._discovered_host = hostname
+        return await self.async_step_confirm_discovery()
+
+    async def async_step_confirm_discovery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm discovered HEOS system."""
+        if user_input is not None:
+            assert self._discovered_host is not None
+            return self.async_create_entry(
+                title=ENTRY_TITLE, data={CONF_HOST: self._discovered_host}
+            )
+
+        self._set_confirm_only()
+        return self.async_show_form(step_id="confirm_discovery")
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Obtain host and validate connection."""
-        self.hass.data.setdefault(DOMAIN, {})
         await self.async_set_unique_id(DOMAIN)
         # Try connecting to host if provided
         errors: dict[str, str] = {}
         host = None
         if user_input is not None:
             host = user_input[CONF_HOST]
-            # Map host from friendly name if in discovered hosts
-            host = self.hass.data[DOMAIN].get(host, host)
             if await _validate_host(host, errors):
-                self.hass.data.pop(DOMAIN)  # Remove discovery data
                 return self.async_create_entry(
-                    title=format_title(host), data={CONF_HOST: host}
+                    title=ENTRY_TITLE, data={CONF_HOST: host}
                 )
 
         # Return form
-        host_type = (
-            str if not self.hass.data[DOMAIN] else vol.In(list(self.hass.data[DOMAIN]))
-        )
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_HOST, default=host): host_type}),
+            data_schema=vol.Schema({vol.Required(CONF_HOST, default=host): str}),
             errors=errors,
         )
 
@@ -182,10 +203,10 @@ class HeosFlowHandler(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Validate account credentials and update options."""
         errors: dict[str, str] = {}
-        entry = self._get_reauth_entry()
+        entry: HeosConfigEntry = self._get_reauth_entry()
         if user_input is not None:
-            heos = cast(Heos, entry.runtime_data.controller_manager.controller)
-            if await _validate_auth(user_input, heos, errors):
+            assert entry.state is ConfigEntryState.LOADED
+            if await _validate_auth(user_input, entry.runtime_data.heos, errors):
                 return self.async_update_reload_and_abort(entry, options=user_input)
 
         return self.async_show_form(
@@ -206,10 +227,8 @@ class HeosOptionsFlowHandler(OptionsFlow):
         """Manage the options."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            heos = cast(
-                Heos, self.config_entry.runtime_data.controller_manager.controller
-            )
-            if await _validate_auth(user_input, heos, errors):
+            entry: HeosConfigEntry = self.config_entry
+            if await _validate_auth(user_input, entry.runtime_data.heos, errors):
                 return self.async_create_entry(data=user_input)
 
         return self.async_show_form(
